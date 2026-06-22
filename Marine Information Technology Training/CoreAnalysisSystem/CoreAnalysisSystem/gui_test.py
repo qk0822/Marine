@@ -21,7 +21,7 @@ class CoreAnalysisApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("地质岩心图文分析系统 · 岩芯智析")
-        self.root.geometry("1350x850")
+        self.root.geometry("1200x700")
         self.root.minsize(1100, 700)
 
         try:
@@ -94,12 +94,12 @@ class CoreAnalysisApp:
 
         ttk.Label(hole_frame, text="最小面积:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.hole_min_area = ttk.Entry(hole_frame, width=12)
-        self.hole_min_area.insert(0, "1")
+        self.hole_min_area.insert(0, "50")
         self.hole_min_area.grid(row=0, column=1, padx=10, pady=2)
 
         ttk.Label(hole_frame, text="最大面积:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.hole_max_area = ttk.Entry(hole_frame, width=12)
-        self.hole_max_area.insert(0, "1000")
+        self.hole_max_area.insert(0, "inf")
         self.hole_max_area.grid(row=1, column=1, padx=10, pady=2)
 
         ttk.Label(hole_frame, text="阈值:").grid(row=2, column=0, sticky=tk.W, pady=2)

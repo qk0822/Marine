@@ -9,342 +9,361 @@ def _safe_percentile(values, q, default=0):
     return float(np.percentile(values, np.clip(q, 0, 100)))
 
 
-def _extract_rock_support(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-
-    mask = ((val < 248) & ((sat > 7) | (gray < 238) | (grad > 4))).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)), iterations=1)
-
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    support = np.zeros_like(mask)
-    min_area = max(200, int(0.003 * image.shape[0] * image.shape[1]))
-    for idx in range(1, num):
-        if stats[idx, cv2.CC_STAT_AREA] >= min_area:
-            support[labels == idx] = 255
-    if np.count_nonzero(support) == 0:
-        support = mask
-    return support
-
-
-def _build_candidates(image, threshold_val=100, clahe_clip=2.0, morph_kernel_size=5):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    lab_l = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[:, :, 0]
-
-    clahe = cv2.createCLAHE(clipLimit=float(clahe_clip), tileGridSize=(8, 8))
-    enhanced = clahe.apply(lab_l)
-    enhanced = cv2.bilateralFilter(enhanced, 5, 40, 40)
-
-    support = _extract_rock_support(image)
-    support_bool = support > 0
-    if np.count_nonzero(support_bool) == 0:
-        support_bool = np.ones_like(gray, dtype=bool)
-
-    sigma = max(4.5, min(image.shape[:2]) / 52.0)
-    local_bg = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    dark_contrast = cv2.subtract(local_bg, enhanced)
-
-    blackhat = np.zeros_like(enhanced)
-    for k in (5, 7, 9, 13):
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        blackhat = np.maximum(blackhat, cv2.morphologyEx(enhanced, cv2.MORPH_BLACKHAT, kernel))
-
-    vals_e = enhanced[support_bool]
-    vals_g = gray[support_bool]
-    vals_c = dark_contrast[support_bool]
-    vals_b = blackhat[support_bool]
-
-    sensitivity = np.clip(float(threshold_val) / 120.0, 0.55, 1.35)
-    dark_thr = _safe_percentile(vals_e, 8 + 8 * sensitivity, 105)
-    soft_dark_thr = _safe_percentile(vals_e, 18 + 9 * sensitivity, 140)
-    gray_thr = _safe_percentile(vals_g, 10 + 8 * sensitivity, 118)
-    contrast_thr = max(4.5, _safe_percentile(vals_c, 79 - 8 * sensitivity, 8))
-    blackhat_thr = max(4.5, _safe_percentile(vals_b, 81 - 8 * sensitivity, 8))
-    deep_gray_thr = _safe_percentile(vals_g, 7 + 6 * sensitivity, 95)
-
-    cand_local = (dark_contrast >= contrast_thr) & (enhanced <= soft_dark_thr) & support_bool
-    cand_bh = (blackhat >= blackhat_thr) & (enhanced <= soft_dark_thr + 5) & support_bool
-    cand_strong_dark = (
-        (enhanced <= dark_thr) &
-        ((dark_contrast >= contrast_thr * 0.78) | (blackhat >= blackhat_thr * 0.78)) &
-        support_bool
+def _extract_material_mask(gray):
+    grad = cv2.morphologyEx(
+        gray,
+        cv2.MORPH_GRADIENT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     )
 
-    candidate = (cand_local | cand_bh | cand_strong_dark).astype(np.uint8) * 255
-    candidate[(gray >= min(220, gray_thr + 80)) & (dark_contrast < contrast_thr * 1.05)] = 0
+    # 非极亮区域 + 有纹理区域作为材料候选
+    mask = ((gray < 248) | (grad > 4)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+        iterations=1
+    )
 
-    # 恢复特别深的小黑孔候选（后续还会再做严格过滤）
-    deep_spot = (
-        (gray <= deep_gray_thr) &
-        (dark_contrast >= contrast_thr * 0.62) &
-        support_bool
-    ).astype(np.uint8) * 255
+    # 去除小噪声，只保留较大的主体区域
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    keep = np.zeros_like(mask)
+    min_area = max(100, int(0.003 * gray.shape[0] * gray.shape[1]))
 
-    k = max(3, int(morph_kernel_size))
-    if k % 2 == 0:
-        k += 1
-    open_k = min(k, 5)
-    close_k = min(max(3, k), 5)
-    candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN,
-                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k)), iterations=1)
-    candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE,
-                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)), iterations=1)
+    for idx in range(1, num):
+        if stats[idx, cv2.CC_STAT_AREA] >= min_area:
+            keep[labels == idx] = 255
 
-    deep_spot = cv2.morphologyEx(deep_spot, cv2.MORPH_OPEN,
-                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    if np.count_nonzero(keep) == 0:
+        keep = np.full_like(mask, 255)
+    return keep
+
+
+def _ring_contrast(mask_u8, gray, material_mask):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    dilated = cv2.dilate(mask_u8, kernel, iterations=1)
+    ring = (dilated > 0) & (mask_u8 == 0) & (material_mask > 0)
+    inside = mask_u8 > 0
+
+    if np.count_nonzero(inside) == 0 or np.count_nonzero(ring) < 6:
+        return 0.0
+
+    return float(np.mean(gray[ring]) - np.mean(gray[inside]))
+
+
+def _build_hole_candidate(gray, threshold_val=85):
+    material_mask = _extract_material_mask(gray)
+    material_bool = material_mask > 0
+
+    # 轻微平滑，减少孤立纹理点影响
+    denoise = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # 局部暗差：孔洞比周围更暗，因此 local_bg - gray 较大
+    sigma = max(4.0, min(gray.shape[:2]) / 32.0)
+    local_bg = cv2.GaussianBlur(denoise, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    dark_contrast = cv2.subtract(local_bg, denoise)
+
+    # 黑帽变换：增强黑色小孔、深色边界和局部暗陷
+    blackhat = np.zeros_like(gray)
+    for k in (7, 11, 17, 25):
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        blackhat = np.maximum(
+            blackhat,
+            cv2.morphologyEx(denoise, cv2.MORPH_BLACKHAT, kernel)
+        )
+
+    vals_gray = denoise[material_bool]
+    vals_contrast = dark_contrast[material_bool]
+    vals_blackhat = blackhat[material_bool]
+
+    # 阈值映射：
+    # 默认 threshold=85 时，整体比旧版 threshold=100 更保守，
+    # 但仍保留图中明显黑孔和深灰孔。
+    threshold_val = float(threshold_val)
+    q = 15 + (threshold_val - 85.0) * 0.10
+    percentile_thr = _safe_percentile(vals_gray, q, 58)
+
+    # 绝对灰度阈值和百分位阈值取较合理者，避免不同亮度图像失效
+    absolute_thr = max(percentile_thr, threshold_val * 0.72)
+    absolute_thr = float(np.clip(absolute_thr, 35, 105))
+
+    # 稍浅孔洞补偿阈值：只允许局部暗差强的区域进入
+    soft_thr = min(absolute_thr + 28, 128)
+    contrast_thr = max(5.0, _safe_percentile(vals_contrast, 72 - (threshold_val - 85.0) * 0.04, 7))
+    blackhat_thr = max(5.0, _safe_percentile(vals_blackhat, 78 - (threshold_val - 85.0) * 0.04, 8))
+
+    # 三路候选：
+    # 1. 绝对深色孔洞
+    # 2. 局部暗差明显的孔洞
+    # 3. 黑帽响应明显的小孔
+    candidate_abs = (denoise <= absolute_thr) & material_bool
+    candidate_local = (denoise <= soft_thr) & (dark_contrast >= contrast_thr) & material_bool
+    candidate_bh = (denoise <= soft_thr) & (blackhat >= blackhat_thr) & material_bool
+
+    candidate = (candidate_abs | candidate_local | candidate_bh).astype(np.uint8) * 255
+
+    # 去除孤立点，再闭合孔洞边界
+    candidate = cv2.morphologyEx(
+        candidate,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)),
+        iterations=1
+    )
+    candidate = cv2.morphologyEx(
+        candidate,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1
+    )
 
     debug = {
-        'support': support,
-        'enhanced': enhanced,
-        'gray': gray,
-        'dark_contrast': dark_contrast,
-        'blackhat': blackhat,
-        'dark_thr': dark_thr,
-        'soft_dark_thr': soft_dark_thr,
-        'gray_thr': gray_thr,
-        'deep_gray_thr': deep_gray_thr,
-        'contrast_thr': contrast_thr,
-        'blackhat_thr': blackhat_thr,
-        'deep_spot': deep_spot,
+        "material_mask": material_mask,
+        "dark_contrast": dark_contrast,
+        "blackhat": blackhat,
+        "absolute_thr": absolute_thr,
+        "soft_thr": soft_thr,
+        "contrast_thr": contrast_thr,
+        "blackhat_thr": blackhat_thr,
     }
     return candidate, debug
 
 
-def _ring_contrast(mask_u8, gray, support):
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    dil = cv2.dilate(mask_u8, k, iterations=1)
-    ring = (dil > 0) & (mask_u8 == 0) & (support > 0)
-    inside = mask_u8 > 0
-    if np.count_nonzero(ring) < 8 or np.count_nonzero(inside) == 0:
-        return 0.0, 0.0, 0.0
-    inner_mean = float(np.mean(gray[inside]))
-    ring_mean = float(np.mean(gray[ring]))
-    return ring_mean - inner_mean, inner_mean, ring_mean
-
-
-def _component_props(mask, debug):
-    gray = debug['gray']
-    enhanced = debug['enhanced']
-    dark_contrast = debug['dark_contrast']
-    blackhat = debug['blackhat']
-    support = debug['support']
-    ys, xs = np.nonzero(mask)
-    h, w = gray.shape[:2]
-    if xs.size == 0:
-        return None
-    if xs.min() <= 1 or ys.min() <= 1 or xs.max() >= w - 2 or ys.max() >= h - 2:
-        return None
-
-    area_px = int(np.count_nonzero(mask))
-    bbox_w = int(xs.max() - xs.min() + 1)
-    bbox_h = int(ys.max() - ys.min() + 1)
-    aspect = max(bbox_w, bbox_h) / (min(bbox_w, bbox_h) + 1e-6)
-    extent = area_px / (bbox_w * bbox_h + 1e-6)
-
-    cnts, _ = cv2.findContours((mask.astype(np.uint8) * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    contour = max(cnts, key=cv2.contourArea)
-    contour_area = max(1.0, float(cv2.contourArea(contour)))
-    perimeter = cv2.arcLength(contour, True)
-    circularity = (4 * np.pi * contour_area) / (perimeter * perimeter + 1e-6) if perimeter > 0 else 0.0
-    hull = cv2.convexHull(contour)
-    hull_area = max(1.0, float(cv2.contourArea(hull)))
-    solidity = contour_area / hull_area
-
-    mean_gray = float(np.mean(gray[mask]))
-    mean_enhanced = float(np.mean(enhanced[mask]))
-    mean_contrast = float(np.mean(dark_contrast[mask]))
-    mean_blackhat = float(np.mean(blackhat[mask]))
-    ring_delta, inner_mean, ring_mean = _ring_contrast(mask.astype(np.uint8) * 255, gray, support)
-
-    return {
-        'mask': mask,
-        'area': float(area_px),
-        'bbox_w': bbox_w,
-        'bbox_h': bbox_h,
-        'aspect': float(aspect),
-        'extent': float(extent),
-        'circularity': float(circularity),
-        'solidity': float(solidity),
-        'mean_gray': mean_gray,
-        'mean_enhanced': mean_enhanced,
-        'mean_contrast': mean_contrast,
-        'mean_blackhat': mean_blackhat,
-        'ring_delta': float(ring_delta),
-        'inner_mean': float(inner_mean),
-        'ring_mean': float(ring_mean),
-        'contour': contour,
-    }
-
-
-def _accept_component(props, debug, effective_circularity, recovery_mode=False):
-    area_px = props['area']
-    aspect = props['aspect']
-    extent = props['extent']
-    circularity = props['circularity']
-    solidity = props['solidity']
-    mean_gray = props['mean_gray']
-    mean_enhanced = props['mean_enhanced']
-    mean_contrast = props['mean_contrast']
-    mean_blackhat = props['mean_blackhat']
-    ring_delta = props['ring_delta']
-
-    # 极小组件单独更严格，减少散点误检。
-    if area_px <= 12:
-        tiny_ok = (ring_delta >= 11.0 and mean_gray <= debug['gray_thr'] + 8 and (circularity >= 0.22 or solidity >= 0.45))
-        if not tiny_ok:
-            return False
-
-    # 细长且面积不小的凹槽，更可能是非孔洞。比 v4 更严格。
-    if aspect > 3.4 and area_px < 220:
-        return False
-    if aspect > 2.25 and area_px > 160 and ring_delta < 18.0 and mean_gray > 90:
-        return False
-
-    # extent 过滤放宽：对“小而深的黑孔”允许较高 extent；
-    # 但对不够暗、不够紧凑的组件仍拒绝。
-    if extent > 0.74 and area_px > 30:
-        compact_dark = (circularity > 0.48 and ring_delta >= 10.0) or (mean_gray < 80 and ring_delta >= 8.0)
-        if not compact_dark:
-            return False
-    elif extent > 0.68 and area_px > 45:
-        if ring_delta < 10.0 and circularity < 0.55:
-            return False
-
-    local_dark_ok = (
-        ring_delta >= (7.0 if not recovery_mode else 9.0) or
-        mean_contrast >= debug['contrast_thr'] * (1.02 if not recovery_mode else 1.08) or
-        mean_blackhat >= debug['blackhat_thr'] * (1.02 if not recovery_mode else 1.08)
-    )
-    if not local_dark_ok:
-        return False
-
-    dark_ok = (
-        mean_enhanced <= debug['soft_dark_thr'] + (0 if not recovery_mode else -2) or
-        mean_gray <= debug['gray_thr'] + (16 if not recovery_mode else 10) or
-        ring_delta >= (12.0 if not recovery_mode else 14.0)
-    )
-    if not dark_ok:
-        return False
-
-    # 形状筛选：普通模式更平衡；恢复模式只接收小而深、较紧凑的暗孔。
-    if recovery_mode:
-        shape_ok = (
-            area_px <= 180 and
-            aspect < 2.7 and
-            (circularity >= max(0.14, effective_circularity * 0.9) or solidity > 0.38) and
-            ring_delta >= 9.0
-        )
-    else:
-        shape_ok = (
-            circularity >= effective_circularity or
-            (aspect < 2.8 and solidity > 0.24 and extent < 0.72) or
-            (area_px <= 20 and aspect < 3.0 and ring_delta >= 9.0) or
-            (mean_gray < 78 and aspect < 3.4 and solidity > 0.18) or
-            (circularity >= 0.42 and ring_delta >= 8.0)
-        )
-    if not shape_ok:
-        return False
-
-    return True
-
-
-def _filter_components(candidate, debug, min_area, max_area, circularity_thresh):
-    support = debug['support']
-    support_area = max(1, int(np.count_nonzero(support)))
-
+def _filter_components(candidate, gray, debug, min_area=8, max_area=10000, circularity_thresh=0.35):
     try:
         max_area = float(max_area)
     except Exception:
         max_area = np.inf
-    if max_area <= 1000:
-        effective_max_area = max(max_area, 0.010 * support_area)
-    else:
-        effective_max_area = max_area
-    effective_min_area = max(1.0, float(min_area))
-    effective_circularity = max(0.06, float(circularity_thresh) * 0.36)
+
+    min_area = max(1.0, float(min_area))
+    material_mask = debug["material_mask"]
 
     num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
     binary = np.zeros_like(candidate)
     components = []
+    h, w = gray.shape[:2]
 
     for idx in range(1, num):
         area_px = int(stats[idx, cv2.CC_STAT_AREA])
-        if area_px < effective_min_area or area_px > effective_max_area:
+        if area_px < min_area or area_px > max_area:
             continue
+
         mask = labels == idx
-        props = _component_props(mask, debug)
-        if props is None:
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
             continue
-        if _accept_component(props, debug, effective_circularity, recovery_mode=False):
-            binary[mask] = 255
-            components.append(props)
 
-    # 第二阶段：恢复漏掉的“小而深的黑孔”。
-    extra = debug['deep_spot'].copy()
-    if np.count_nonzero(binary) > 0:
-        dil = cv2.dilate(binary, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
-        extra[dil > 0] = 0
+        # 允许边缘处的半孔洞被识别；只过滤极大、极满的边界伪影。
+        touches_border = xs.min() <= 1 or ys.min() <= 1 or xs.max() >= w - 2 or ys.max() >= h - 2
 
-    num2, labels2, stats2, _ = cv2.connectedComponentsWithStats(extra, 8)
-    for idx in range(1, num2):
-        area_px = int(stats2[idx, cv2.CC_STAT_AREA])
-        if area_px < effective_min_area or area_px > min(220.0, effective_max_area):
+        bbox_w = int(xs.max() - xs.min() + 1)
+        bbox_h = int(ys.max() - ys.min() + 1)
+        aspect = max(bbox_w, bbox_h) / (min(bbox_w, bbox_h) + 1e-6)
+        extent = area_px / (bbox_w * bbox_h + 1e-6)
+
+        if touches_border and area_px > 900 and extent > 0.70:
             continue
-        mask = labels2 == idx
-        props = _component_props(mask, debug)
-        if props is None:
+
+        cnts, _ = cv2.findContours(
+            (mask.astype(np.uint8) * 255),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not cnts:
             continue
-        if _accept_component(props, debug, effective_circularity, recovery_mode=True):
-            binary[mask] = 255
-            components.append(props)
+
+        contour = max(cnts, key=cv2.contourArea)
+        contour_area = max(1.0, float(cv2.contourArea(contour)))
+        perimeter = cv2.arcLength(contour, True)
+        circularity = (4 * np.pi * contour_area) / (perimeter * perimeter + 1e-6) if perimeter > 0 else 0.0
+        hull = cv2.convexHull(contour)
+        hull_area = max(1.0, float(cv2.contourArea(hull)))
+        solidity = contour_area / hull_area
+
+        mean_gray = float(np.mean(gray[mask]))
+        ring_delta = _ring_contrast(mask.astype(np.uint8) * 255, gray, material_mask)
+
+        # 去掉明显细长纹理/划痕
+        if aspect > 5.0 and area_px < 350:
+            continue
+
+        # 过满且不够圆、不够暗的候选更像纹理块
+        if extent > 0.88 and circularity < 0.32 and mean_gray > debug["absolute_thr"] + 18:
+            continue
+
+        # 很小的候选必须足够暗或与周围差异明显
+        if area_px < 15:
+            if not (mean_gray <= debug["absolute_thr"] - 5 or ring_delta >= 12):
+                continue
+
+        # 形状允许不规则，但不能完全不像孔洞
+        shape_ok = (
+            circularity >= max(0.08, float(circularity_thresh) * 0.35) or
+            (solidity >= 0.28 and aspect <= 3.8) or
+            (mean_gray <= debug["absolute_thr"] - 8 and aspect <= 4.5)
+        )
+        if not shape_ok:
+            continue
+
+        # 孔洞应足够暗，或者至少比周围环带暗
+        dark_ok = (
+            mean_gray <= debug["soft_thr"] or
+            ring_delta >= 8
+        )
+        if not dark_ok:
+            continue
+
+        binary[mask] = 255
+        components.append({
+            "area": float(area_px),
+            "circularity": float(circularity),
+            "solidity": float(solidity),
+            "aspect": float(aspect),
+            "mean_gray": mean_gray,
+            "ring_delta": float(ring_delta),
+            "contour": contour,
+        })
 
     return binary, components
 
 
-def analysis_holes(image, min_area=1, max_area=1000, threshold_val=100,
-                   circularity_thresh=0.5, clahe_clip=2.0, morph_kernel_size=5):
+
+def _recover_left_border_holes(binary, gray, debug, min_area=8):
+    h, w = gray.shape[:2]
+    border_w = max(18, int(0.07 * w))      # 左侧补偿区域，约占图宽 7%
+    ignore_edge = 2                         # 忽略最左侧连续黑边
+
+    # 只在左边界附近寻找补偿孔洞，不影响其他区域。
+    roi_gray = gray[:, :border_w].copy()
+    material = debug.get("material_mask", np.full_like(gray, 255))
+
+    # 采用比主体检测略宽松的深色阈值，但只作用在左边界窄区域。
+    local_thr = min(debug["soft_thr"], debug["absolute_thr"] + 28)
+    seed = (roi_gray <= local_thr).astype(np.uint8) * 255
+
+    # 忽略最左侧连续黑边，避免所有边界暗区连成一条竖向大块。
+    seed[:, :ignore_edge] = 0
+
+    # 去除零散噪声，并轻微闭合半孔洞。
+    seed = cv2.morphologyEx(
+        seed,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)),
+        iterations=1
+    )
+    seed = cv2.morphologyEx(
+        seed,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1
+    )
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(seed, 8)
+    recovered = np.zeros_like(binary)
+
+    for idx in range(1, num):
+        x, y, bw, bh, area = stats[idx]
+        area = int(area)
+
+        # 只补偿边界附近的半孔洞，不处理较远区域。
+        if x > border_w * 0.75:
+            continue
+
+        # 面积过滤：小于最小面积的噪声不要；过大的边界阴影不要。
+        if area < max(5, int(min_area * 0.65)) or area > 420:
+            continue
+
+        # 形状过滤：边界半孔洞可以不完整，但不能是细长划痕。
+        aspect = max(bw, bh) / (min(bw, bh) + 1e-6)
+        if aspect > 3.8 and area < 250:
+            continue
+        if bh > 55 or bw > border_w:
+            continue
+
+        comp = labels == idx
+        full_mask = np.zeros_like(binary)
+        full_mask[:, :border_w][comp] = 255
+
+        # 要求内部确实较暗，或相对周围明显更暗。
+        mean_gray = float(np.mean(gray[full_mask > 0]))
+        ring_delta = _ring_contrast(full_mask, gray, material)
+        if not (mean_gray <= debug["soft_thr"] or ring_delta >= 6):
+            continue
+
+        # 如果这个补偿区域已经被原算法识别过，则不重复统计，但保留边界形状。
+        # 膨胀一下，让半孔洞的轮廓能靠到图像边界。
+        comp_u8 = full_mask.astype(np.uint8)
+        comp_u8 = cv2.dilate(
+            comp_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1
+        )
+
+        # 只允许写入左侧补偿区，确保不影响其他孔洞。
+        mask_limit = np.zeros_like(binary)
+        mask_limit[:, :border_w] = 255
+        comp_u8 = cv2.bitwise_and(comp_u8, mask_limit)
+        recovered = cv2.bitwise_or(recovered, comp_u8)
+
+    # 只补充，不删除原检测结果。
+    return cv2.bitwise_or(binary, recovered)
+
+def analysis_holes(image, min_area=50, max_area=np.inf, threshold_val=85,
+                   circularity_thresh=0.35, clahe_clip=2.0, morph_kernel_size=5):
     if image is None:
         return {}, None, None, None
 
-    candidate, debug = _build_candidates(
-        image,
-        threshold_val=threshold_val,
-        clahe_clip=clahe_clip,
-        morph_kernel_size=morph_kernel_size,
-    )
+    # 兼容灰度、BGR、BGRA 输入
+    if len(image.shape) == 2:
+        gray = image.copy()
+        display_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    else:
+        if image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        display_img = image.copy()
+
+    candidate, debug = _build_hole_candidate(gray, threshold_val=threshold_val)
     binary, components = _filter_components(
         candidate,
+        gray,
         debug,
         min_area=min_area,
         max_area=max_area,
-        circularity_thresh=circularity_thresh,
+        circularity_thresh=circularity_thresh
     )
 
-    result_img = image.copy()
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(result_img, contours, -1, (0, 255, 0), 2)
+    # 仅补偿左侧边界漏掉的半孔洞，不改变其他区域已有识别结果。
+    binary = _recover_left_border_holes(binary, gray, debug, min_area=min_area)
 
-    areas = [c['area'] for c in components]
-    circularities = [c['circularity'] for c in components]
-    total_hole_area = float(sum(areas))
-    hole_count = len(components)
+    result_img = display_img.copy()
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 用较粗红色轮廓，接近期望图中标注效果
+    cv2.drawContours(result_img, contours, -1, (0, 0, 255), 3)
+
+    # 根据最终 binary 重新统计，确保左边界补偿孔洞也被计入结果。
+    areas = []
+    circularities = []
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area <= 0:
+            continue
+        perimeter = cv2.arcLength(cnt, True)
+        circularity = (4 * np.pi * area) / (perimeter * perimeter + 1e-6) if perimeter > 0 else 0.0
+        areas.append(area)
+        circularities.append(float(circularity))
+
+    total_area = float(sum(areas))
+    count = len(areas)
 
     result = {
-        '孔洞数量': hole_count,
-        '总面积': total_hole_area,
-        '平均面积': total_hole_area / hole_count if hole_count > 0 else 0.0,
-        '平均圆形度': float(np.mean(circularities)) if circularities else 0.0,
-        '面积列表': areas,
-        '最大孔洞面积': float(max(areas)) if areas else 0.0,
-        '最小孔洞面积': float(min(areas)) if areas else 0.0,
+        "孔洞数量": count,
+        "总面积": total_area,
+        "平均面积": total_area / count if count > 0 else 0.0,
+        "平均圆形度": float(np.mean(circularities)) if circularities else 0.0,
+        "面积列表": areas,
+        "最大孔洞面积": float(max(areas)) if areas else 0.0,
+        "最小孔洞面积": float(min(areas)) if areas else 0.0,
     }
-    return result, debug['enhanced'], binary, result_img
+
+    return result, gray, binary, result_img
